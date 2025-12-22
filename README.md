@@ -1,0 +1,1 @@
+# vbox-linked-clone-bootstrap

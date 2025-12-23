@@ -23,6 +23,9 @@ CONFIG_NIC=""
 SSH_NIC=""
 NET_MODE=""
 
+GITHUB_KEY_CREATE=true
+GITHUB_KEY_UPLOAD=false
+
 # ======================================================
 # Helpers
 # ======================================================
@@ -152,6 +155,8 @@ while [[ $# -gt 0 ]]; do
     --debug) DEBUG=true; shift ;;
     --stop-after) STOP_AFTER="$2"; shift 2 ;;
     --print-vars) PRINT_VARS=true; shift ;;
+    --github-key-upload) GITHUB_KEY_UPLOAD=true; shift ;;
+    --no-github-key) GITHUB_KEY_CREATE=false; shift ;;
     -h|--help)
       cat <<EOF
 Usage:
@@ -168,6 +173,11 @@ Optional:
   --snapshot NAME       Snapshot name (default: base-clean)
   --dry-run
   --print-vars
+
+GitHub SSH:
+  --github-key-upload     Upload generated GitHub SSH key
+  --no-github-key         Do not generate GitHub SSH key
+
 EOF
       exit 0 ;;
     *) fail "Unknown option: $1" ;;
@@ -354,62 +364,47 @@ run_ssh "/usr/local/bin/tee-test.sh || echo 'EXEC FAILED'"
 stop_if_requested "debug-tee"
 
 # ======================================================
-section "github-ssh"
+section "push-github-scripts"
 # ======================================================
 
-run_ssh "sudo tee /usr/local/bin/setup-github-ssh >/dev/null <<'EOF'
-#!/usr/bin/env bash
-set -e
-
-USER_HOME=\"/home/${SSH_USER}\"
-SSH_DIR=\"\$USER_HOME/.ssh\"
-HOST=\"\$(hostname -s)\"
-KEY=\"\$SSH_DIR/id_github_\${HOST}\"
-MARKER=\"\$SSH_DIR/.github_ssh_done\"
-EMAIL=\"glenn.poder@github\"
-
-mkdir -p \"\$SSH_DIR\"
-chmod 700 \"\$SSH_DIR\"
-
-if [[ -f \"\$MARKER\" ]]; then
-    echo \"GitHub SSH already configured\"
-    exit 0
+if $GITHUB_KEY_CREATE; then
+  scp scripts/github-ssh-key.sh \
+      scripts/github-ssh-key-manage.sh \
+      "${SSH_USER}@${IP}:/tmp/"
+else
+  echo "Skipping GitHub SSH script copy"
 fi
 
-ssh-keygen -t ed25519 -C \"\$EMAIL\" -f \"\$KEY\" -N \"\"
+stop_if_requested "push-github-scripts"
 
-cat >> \"\$SSH_DIR/config\" <<EOC
+# ======================================================
+section "install-github-tools"
+# ======================================================
 
-Host github.com
-    HostName github.com
-    User git
-    IdentityFile \$KEY
-    IdentitiesOnly yes
-EOC
+if $GITHUB_KEY_CREATE; then
+  run_ssh "sudo install -m 0755 /tmp/github-ssh-key.sh /usr/local/bin/github-ssh-key"
+  run_ssh "sudo install -m 0755 /tmp/github-ssh-key-manage.sh /usr/local/bin/github-ssh-key-manage"
+else
+  echo "Skipping GitHub SSH tooling installation"
+fi
 
-chmod 600 \"\$SSH_DIR/config\"
-chown -R ${SSH_USER}:${SSH_USER} \"\$SSH_DIR\"
+stop_if_requested "install-github-tools"
 
-# Upload key to GitHub (argument-safe)
-sudo -iu ${SSH_USER} -- gh ssh-key add \"\$KEY.pub\" -t \"\${HOST}\"
+# ======================================================
+section "github-ssh-key"
+# ======================================================
 
-# Pre-seed GitHub host key (avoid verification prompt)
-ssh-keyscan github.com >> "\$USER_HOME/.ssh/known_hosts" 2>/dev/null
-chmod 644 "\$USER_HOME/.ssh/known_hosts"
+if $GITHUB_KEY_CREATE; then
+  if $GITHUB_KEY_UPLOAD; then
+    run_ssh "sudo -iu ${SSH_USER} github-ssh-key --upload"
+  else
+    run_ssh "sudo -iu ${SSH_USER} github-ssh-key"
+  fi
+else
+  echo "GitHub SSH key generation disabled"
+fi
 
-# Verify (non-fatal)
-ssh -T git@github.com || true
-
-touch \"\$MARKER\"
-
-echo \"GitHub SSH key for \$(hostname):\"
-cat \"\$KEY.pub\"
-EOF"
-
-run_ssh "sudo chmod +x /usr/local/bin/setup-github-ssh"
-run_ssh "sudo -iu ${SSH_USER} /usr/local/bin/setup-github-ssh"
-
-stop_if_requested "github-ssh"
+stop_if_requested "github-ssh-key"
 
 # ======================================================
 section "summary"

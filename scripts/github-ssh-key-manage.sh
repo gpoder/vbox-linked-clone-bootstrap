@@ -2,9 +2,15 @@
 set -euo pipefail
 
 # github-ssh-key-manage.sh
-# - Lists GitHub SSH keys via gh
-# - Interactive bulk delete by selecting numbers
-# - Self-delete mode deletes key whose title == hostname (safe for VM destroy)
+# Uses: gh api user/keys (works on old gh)
+#
+# Requires:
+#   - gh (authenticated)
+#   - jq
+#
+# Keys are identified reliably by:
+#   - id
+#   - title
 
 usage() {
   cat <<'EOF'
@@ -12,21 +18,18 @@ Usage:
   github-ssh-key-manage.sh [options]
 
 Options:
-  --list               List keys (default behavior)
+  --list               List GitHub SSH keys (default)
   --delete             Interactive delete (select numbers)
-  --self-delete        Delete key with title == $(hostname -s)
-  --match PREFIX       Delete keys whose title starts with PREFIX (interactive confirm)
-  --yes                Skip "are you sure" confirmations (dangerous)
-  -h, --help           Show help
+  --self-delete        Delete key with title == hostname -s
+  --match PREFIX       Delete keys whose title starts with PREFIX
+  --yes                Skip confirmation prompts
+  -h, --help           Show this help
 
-Dependencies:
-  - gh (authenticated)
-  - jq (recommended for reliable parsing)
-
-Notes:
-  - Keys are identified by GitHub numeric id.
-  - This script uses: gh ssh-key list --json id,title
-
+Examples:
+  github-ssh-key-manage --list
+  github-ssh-key-manage --delete
+  github-ssh-key-manage --self-delete
+  github-ssh-key-manage --match newvm
 EOF
 }
 
@@ -46,115 +49,113 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-command -v gh >/dev/null 2>&1 || { echo "gh not installed" >&2; exit 2; }
-gh auth status >/dev/null 2>&1 || { echo "gh not authenticated. Run: gh auth login" >&2; exit 3; }
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 2; }; }
+need gh
+need jq
 
-# Prefer jq for correctness
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq not installed. Install: sudo apt install -y jq" >&2
-  exit 4
-fi
-
-fetch_json() {
-  # gh ssh-key list supports --json in modern gh; you already have it.
-  gh ssh-key list --json id,title
-}
-
-print_numbered() {
-  local json="$1"
-  echo
-  echo "GitHub SSH keys:"
-  echo "----------------"
-  echo "$json" | jq -r '.[] | "\(.id)\t\(.title)"' | nl -w2 -s'. '
+gh auth status >/dev/null 2>&1 || {
+  echo "gh not authenticated. Run: gh auth login" >&2
+  exit 3
 }
 
 confirm() {
   local prompt="$1"
-  if $ASSUME_YES; then return 0; fi
+  $ASSUME_YES && return 0
   read -rp "$prompt (y/N): " ans
   [[ "${ans,,}" == "y" ]]
 }
 
-delete_ids() {
-  local ids=("$@")
-  for id in "${ids[@]}"; do
-    [[ -n "$id" ]] || continue
-    gh ssh-key delete "$id" --yes
-  done
+# Fetch keys as JSON once
+KEYS_JSON="$(gh api user/keys)"
+
+# Normalized table:
+#   id<TAB>title
+keys_table() {
+  echo "$KEYS_JSON" | jq -r '.[] | "\(.id)\t\(.title)"'
+}
+
+print_numbered() {
+  local table="$1"
+  echo
+  echo "GitHub SSH keys:"
+  echo "----------------"
+  echo "$table" | nl -w2 -s'. ' | sed $'s/\t/  |  /'
+}
+
+delete_key_id() {
+  local id="$1"
+  gh api --method DELETE "user/keys/$id" >/dev/null
 }
 
 case "$MODE" in
   list)
-    json="$(fetch_json)"
-    print_numbered "$json"
-    ;;
-
-  self)
-    host="$(hostname -s)"
-    json="$(fetch_json)"
-    id="$(echo "$json" | jq -r --arg t "$host" '.[] | select(.title==$t) | .id' | head -n1)"
-
-    if [[ -z "$id" || "$id" == "null" ]]; then
-      echo "No GitHub SSH key found with title: $host"
+    table="$(keys_table)"
+    if [[ -z "$table" ]]; then
+      echo "No SSH keys found."
       exit 0
     fi
-
-    echo "Found key id=$id title=$host"
-    confirm "Delete this key?" || exit 0
-    delete_ids "$id"
-    echo "Deleted key: $host"
-    ;;
-
-  match)
-    [[ -n "$MATCH_PREFIX" ]] || { echo "--match requires PREFIX" >&2; exit 1; }
-    json="$(fetch_json)"
-    print_numbered "$json"
-
-    mapfile -t ids < <(echo "$json" | jq -r --arg p "$MATCH_PREFIX" '.[] | select(.title|startswith($p)) | .id')
-    mapfile -t titles < <(echo "$json" | jq -r --arg p "$MATCH_PREFIX" '.[] | select(.title|startswith($p)) | .title')
-
-    if [[ ${#ids[@]} -eq 0 ]]; then
-      echo "No keys matched prefix: $MATCH_PREFIX"
-      exit 0
-    fi
-
-    echo
-    echo "Keys to delete (prefix: $MATCH_PREFIX):"
-    for i in "${!ids[@]}"; do
-      echo "  id=${ids[$i]} title=${titles[$i]}"
-    done
-
-    confirm "Delete ALL matched keys?" || exit 0
-    delete_ids "${ids[@]}"
-    echo "Deleted ${#ids[@]} keys."
+    print_numbered "$table"
     ;;
 
   delete)
-    json="$(fetch_json)"
-    print_numbered "$json"
+    table="$(keys_table)"
+    [[ -n "$table" ]] || { echo "No SSH keys found."; exit 0; }
 
-    total="$(echo "$json" | jq 'length')"
-    [[ "$total" -gt 0 ]] || { echo "No keys found."; exit 0; }
+    print_numbered "$table"
+    mapfile -t ids < <(echo "$table" | awk -F'\t' '{print $1}')
+    mapfile -t titles < <(echo "$table" | awk -F'\t' '{print $2}')
 
     echo
     read -rp "Enter numbers to delete (e.g. 1 3 5): " selection
+    [[ -n "${selection// }" ]] || { echo "Nothing selected."; exit 0; }
 
-    # Build array index -> id mapping
-    # jq arrays are 0-based; user input is 1-based
-    ids_to_delete=()
+    to_delete=()
     for n in $selection; do
       [[ "$n" =~ ^[0-9]+$ ]] || { echo "Invalid selection: $n" >&2; exit 1; }
       idx=$((n-1))
-      id="$(echo "$json" | jq -r ".[$idx].id")"
-      title="$(echo "$json" | jq -r ".[$idx].title")"
-      [[ "$id" != "null" ]] || { echo "Selection out of range: $n" >&2; exit 1; }
-      ids_to_delete+=("$id")
-      echo "Selected: id=$id title=$title"
+      [[ $idx -ge 0 && $idx -lt ${#ids[@]} ]] || { echo "Out of range: $n" >&2; exit 1; }
+      echo "Selected: id=${ids[$idx]} title=${titles[$idx]}"
+      to_delete+=("${ids[$idx]}")
     done
 
     echo
     confirm "Delete selected keys?" || exit 0
-    delete_ids "${ids_to_delete[@]}"
+    for id in "${to_delete[@]}"; do delete_key_id "$id"; done
+    echo "Done."
+    ;;
+
+  self)
+    host="$(hostname -s)"
+    match_id="$(echo "$KEYS_JSON" \
+      | jq -r --arg h "$host" '.[] | select(.title==$h) | .id' | head -n1)"
+
+    if [[ -z "$match_id" ]]; then
+      echo "No key found with title: $host"
+      exit 0
+    fi
+
+    echo "Matched key id=$match_id title=$host"
+    confirm "Delete this key?" || exit 0
+    delete_key_id "$match_id"
+    echo "Deleted."
+    ;;
+
+  match)
+    [[ -n "$MATCH_PREFIX" ]] || { echo "--match requires PREFIX" >&2; exit 1; }
+
+    mapfile -t ids < <(
+      echo "$KEYS_JSON" | jq -r --arg p "$MATCH_PREFIX" \
+        '.[] | select(.title | startswith($p)) | .id'
+    )
+
+    [[ ${#ids[@]} -gt 0 ]] || {
+      echo "No keys matched prefix: $MATCH_PREFIX"
+      exit 0
+    }
+
+    echo "Matched ${#ids[@]} keys."
+    confirm "Delete ALL matched keys?" || exit 0
+    for id in "${ids[@]}"; do delete_key_id "$id"; done
     echo "Done."
     ;;
 
